@@ -274,6 +274,15 @@ function stop() {
 
 $("btnStart").onclick = () => start().catch(e => { status("失敗: " + e.message); stop(); });
 $("btnStop").onclick = stop;
+
+// UI画面を閉じたらサーバごと正常終了させる。
+// pagehide で /shutdown に beacon を送る -> サーバは8秒待って再接続が無ければ exit
+// (F5リロードは直後の GET / で終了予約が取り消されるため誤終了しない)。
+window.addEventListener("pagehide", () => {
+  try { navigator.sendBeacon("/shutdown"); } catch (_) {}
+  try { ws && ws.close(); } catch (_) {}
+  try { micStream && micStream.getTracks().forEach(t => t.stop()); } catch (_) {}
+});
 </script>
 </body>
 </html>

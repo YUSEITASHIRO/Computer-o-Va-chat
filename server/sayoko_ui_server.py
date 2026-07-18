@@ -42,6 +42,16 @@ lm_gen = None
 forced = None
 sp = None
 busy = False
+shutdown_handle = None   # ブラウザクローズ後の終了予約 (asyncio TimerHandle)
+
+
+def cancel_shutdown() -> None:
+    """クライアントが戻ってきた (リロード/再接続) ので終了予約を取り消す。"""
+    global shutdown_handle
+    if shutdown_handle is not None:
+        shutdown_handle.cancel()
+        shutdown_handle = None
+        print("[shutdown] cancelled (client returned)", flush=True)
 
 
 class ForcedTextLMGen:
@@ -119,6 +129,7 @@ def load_models() -> None:
 
 async def ws_handler(request: web.Request) -> web.WebSocketResponse:
     global busy
+    cancel_shutdown()
     ws = web.WebSocketResponse(max_msg_size=0)
     await ws.prepare(request)
     if busy:
@@ -178,7 +189,24 @@ async def healthz(_req: web.Request) -> web.Response:
 
 
 async def index(_req: web.Request) -> web.FileResponse:
+    cancel_shutdown()   # ページ(再)読込 = クライアント健在
     return web.FileResponse(STATIC_DIR / "index.html")
+
+
+async def shutdown_beacon(_req: web.Request) -> web.Response:
+    """UI画面クローズ時に sendBeacon で叩かれる。8秒以内にリロード/再接続が
+    無ければサーバごと終了する (→ ssh セッションが閉じ、run.bat 側の窓も消える)。
+    F5 リロードでは直後に GET / が来るため誤終了しない。"""
+    global shutdown_handle
+
+    def do_exit() -> None:
+        print("[shutdown] client gone; exiting", flush=True)
+        os._exit(0)
+
+    if shutdown_handle is None:
+        print("[shutdown] beacon received; exit in 8s unless client returns", flush=True)
+        shutdown_handle = asyncio.get_event_loop().call_later(8, do_exit)
+    return web.Response(text="bye")
 
 
 def main() -> None:
@@ -187,6 +215,7 @@ def main() -> None:
     app.router.add_get("/", index)
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/ws", ws_handler)
+    app.router.add_post("/shutdown", shutdown_beacon)   # sendBeacon は POST
     app.router.add_static("/static", STATIC_DIR)
     port = int(os.environ.get("PORT", "8998"))
     print(f"[serve] http://0.0.0.0:{port}", flush=True)
