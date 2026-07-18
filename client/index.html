@@ -49,9 +49,7 @@
     <label style="font-size:.85rem; display:flex; align-items:center; gap:6px;">
       <input type="checkbox" id="gptMode"> 外部LLM応答の注入 (発話確定ごとに gpt-4o-mini の回答をサヨ子の声で読み上げ)
     </label>
-    <input type="password" id="apiKey" placeholder="OpenAI APIキー (未設定なら注入なし)"
-           style="flex:1; min-width:220px; font:inherit; font-size:.8rem; padding:6px 10px;
-                  border-radius:8px; border:1px solid var(--line); background:#141311; color:var(--ink);">
+    <span id="keyState" style="font-size:.78rem; color:var(--sub);"></span>
     <span id="gptStatus" style="font-size:.8rem; color:var(--sub);"></span>
   </div>
   <div class="panel"><div id="chat"></div></div>
@@ -94,17 +92,24 @@ function userText(text, final) {
 }
 
 /* ---------------- 波形 ---------------- */
+// 会話音声は振幅が小さく素の波形では見づらいため表示ゲインを掛ける。
+// サヨ子側は合成音声で特にレベルが低いので強めに増幅する。
+const WAVE_GAIN_USER = 3.5, WAVE_GAIN_SAYOKO = 7.0;
 function draw() {
-  for (const [ana, cv, color] of [[anaU, $("waveUser"), "#7fb4d9"], [anaS, $("waveSayoko"), "#e6a06b"]]) {
+  for (const [ana, cv, color, gain] of [
+      [anaU, $("waveUser"),   "#7fb4d9", WAVE_GAIN_USER],
+      [anaS, $("waveSayoko"), "#e6a06b", WAVE_GAIN_SAYOKO]]) {
     if (!ana) continue;
     const ctx = cv.getContext("2d");
-    const buf = new Uint8Array(ana.fftSize);
-    ana.getByteTimeDomainData(buf);
-    ctx.fillStyle = "#141311"; ctx.fillRect(0, 0, cv.width, cv.height);
-    ctx.strokeStyle = color; ctx.lineWidth = 1.6; ctx.beginPath();
+    const buf = new Float32Array(ana.fftSize);
+    ana.getFloatTimeDomainData(buf);
+    const h = cv.height, mid = h / 2;
+    ctx.fillStyle = "#141311"; ctx.fillRect(0, 0, cv.width, h);
+    ctx.strokeStyle = color; ctx.lineWidth = 1.8; ctx.beginPath();
     for (let i = 0; i < buf.length; i++) {
       const x = i / buf.length * cv.width;
-      const y = (buf[i] / 255) * cv.height;
+      const v = Math.max(-1, Math.min(1, buf[i] * gain));
+      const y = mid - v * (mid - 2);
       i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
     }
     ctx.stroke();
@@ -143,27 +148,28 @@ registerProcessor("cap", Cap);
 registerProcessor("player", Player);
 `;
 
-/* ---------------- GPT-live: 裏のLLMに考えさせて注入 ---------------- */
-// APIキーの入手経路: URLフラグメント #k=... (run.bat が .env から渡す。サーバへは送信されない)
-// -> localStorage に保存 -> 入力欄。キーはこのPCの外に出ない (OpenAI API 直叩きのみ)。
+/* ---------------- 外部LLM応答の注入 ---------------- */
+// APIキーは run.bat が .env から読み、URLフラグメント (#k=) で渡す。
+// フラグメントは HTTP リクエストに含まれずサーバへ渡らない。ここでは JS 変数にのみ
+// 保持し、localStorage 等への永続化はしない (画面入力・保存は行わない方針)。
+let OA_KEY = "";
 (function initKey() {
+  localStorage.removeItem("oa_key");   // 旧版が保存したキーのキャッシュを消去
   const m = location.hash.match(/k=([^&]+)/);
-  if (m) { localStorage.setItem("oa_key", decodeURIComponent(m[1]));
-           history.replaceState(null, "", location.pathname); }
-  const k = localStorage.getItem("oa_key") || "";
-  $("apiKey").value = k;
-  $("gptMode").checked = !!k;
+  if (m) OA_KEY = decodeURIComponent(m[1]);
+  history.replaceState(null, "", location.pathname);  // URLからも即時消去
+  $("gptMode").checked = !!OA_KEY;
+  $("gptMode").disabled = !OA_KEY;
+  $("keyState").textContent = OA_KEY
+    ? "APIキー: .env から取得済み (画面には出しません)"
+    : "APIキー未設定: .env に OPENAI_KEY= を置いて run.bat から起動してください";
 })();
-$("apiKey").onchange = () => {
-  localStorage.setItem("oa_key", $("apiKey").value.trim());
-  $("gptMode").checked = !!$("apiKey").value.trim();
-};
 
 const history_ = [];   // {role, content} 直近の対話履歴
 let thinking = false;
 
 async function askGPT(userUtt) {
-  const key = $("apiKey").value.trim();
+  const key = OA_KEY;
   if (!$("gptMode").checked || !key || thinking) return;
   thinking = true;
   $("gptStatus").textContent = "LLM応答待ち...";
@@ -265,23 +271,25 @@ async function start() {
 function stop() {
   running = false;
   $("btnStart").disabled = false; $("btnStop").disabled = true;
-  try { rec && rec.stop(); } catch (_) {}
-  try { ws && ws.close(); } catch (_) {}
-  try { micStream && micStream.getTracks().forEach(t => t.stop()); } catch (_) {}
-  try { ac && ac.close(); } catch (_) {}
-  status("停止しました");
+  // 確保した資源をすべて解放する (マイク・WS・AudioContext・解析ノード)
+  try { rec && rec.stop(); } catch (_) {} rec = null;
+  try { ws && ws.close(); } catch (_) {} ws = null;
+  try { micStream && micStream.getTracks().forEach(t => t.stop()); } catch (_) {} micStream = null;
+  try { ac && ac.close(); } catch (_) {} ac = null;
+  anaU = anaS = null;
+  status("停止しました (資源解放済み)");
 }
 
 $("btnStart").onclick = () => start().catch(e => { status("失敗: " + e.message); stop(); });
 $("btnStop").onclick = stop;
 
 // UI画面を閉じたらサーバごと正常終了させる。
-// pagehide で /shutdown に beacon を送る -> サーバは8秒待って再接続が無ければ exit
-// (F5リロードは直後の GET / で終了予約が取り消されるため誤終了しない)。
+// pagehide で /shutdown に beacon を送る -> サーバは8秒待って再接続が無ければ
+// GPU メモリを解放して exit (F5リロードは直後の GET / で終了予約が取り消される)。
+// ブラウザ側の資源 (マイク・AudioContext・WS) もここで解放する。
 window.addEventListener("pagehide", () => {
   try { navigator.sendBeacon("/shutdown"); } catch (_) {}
-  try { ws && ws.close(); } catch (_) {}
-  try { micStream && micStream.getTracks().forEach(t => t.stop()); } catch (_) {}
+  stop();
 });
 </script>
 </body>

@@ -180,7 +180,9 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
                     await ws.send_json({"type": "text", "text": piece})
     finally:
         busy = False
-        print("[ws] session end", flush=True)
+        # セッション中に溜まった一時テンソル/断片化キャッシュを返す
+        torch.cuda.empty_cache()
+        print("[ws] session end (cache released)", flush=True)
     return ws
 
 
@@ -200,7 +202,22 @@ async def shutdown_beacon(_req: web.Request) -> web.Response:
     global shutdown_handle
 
     def do_exit() -> None:
-        print("[shutdown] client gone; exiting", flush=True)
+        # GPU メモリとキャッシュを明示的に解放してから終了する
+        global mimi, lm_gen, forced
+        print("[shutdown] client gone; releasing GPU memory...", flush=True)
+        try:
+            torch.cuda.synchronize()
+            forced = None
+            lm_gen = None
+            mimi = None
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+            print(f"[shutdown] cuda allocated after release: "
+                  f"{torch.cuda.memory_allocated()/1e9:.2f} GB", flush=True)
+        except Exception as e:
+            print(f"[shutdown] release failed (続行): {e}", flush=True)
+        print("[shutdown] exiting", flush=True)
         os._exit(0)
 
     if shutdown_handle is None:
