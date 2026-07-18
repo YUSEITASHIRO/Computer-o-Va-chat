@@ -150,10 +150,16 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
                     except Exception:
                         continue
                     if m.get("type") == "say" and m.get("text"):
-                        # GPT-live: LLM 回答をテキストチャンネルへ注入する
-                        inject_queue = list(sp.encode(str(m["text"])))
-                        inject_tick = 0
-                        print(f"[inject] {len(inject_queue)} tokens: {m['text'][:40]}", flush=True)
+                        # LLM 回答をテキストチャンネルへ注入する。
+                        # mode=append: ストリーミング注入用 (文の断片が届くたびキュー末尾へ足す)
+                        toks = list(sp.encode(str(m["text"])))
+                        if m.get("mode") == "append" and inject_queue:
+                            inject_queue.extend(toks)
+                        else:
+                            inject_queue = toks
+                            inject_tick = 0
+                        print(f"[inject:{m.get('mode','replace')}] +{len(toks)} tokens: "
+                              f"{str(m['text'])[:40]}", flush=True)
                     continue
                 if msg.type != WSMsgType.BINARY:
                     continue

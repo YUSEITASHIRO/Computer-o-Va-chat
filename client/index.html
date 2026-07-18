@@ -175,12 +175,15 @@ async function askGPT(userUtt) {
   $("gptStatus").textContent = "LLM応答待ち...";
   try {
     history_.push({ role: "user", content: userUtt });
+    // stream:true で受信し、句読点区切りの断片が揃うたびに注入する
+    // (全文完成を待たないぶん発話開始が約1秒早くなる)
     const res = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + key },
       body: JSON.stringify({
         model: "gpt-4o-mini",
         max_tokens: 120,
+        stream: true,
         messages: [
           { role: "system", content:
             "あなたは81歳の優しい女性「サヨ子」です。相手の話を受け止めて、" +
@@ -190,15 +193,36 @@ async function askGPT(userUtt) {
         ],
       }),
     });
-    const j = await res.json();
-    const ans = j.choices?.[0]?.message?.content?.trim();
-    if (ans && ws && ws.readyState === 1) {
-      history_.push({ role: "assistant", content: ans });
-      ws.send(JSON.stringify({ type: "say", text: ans }));
-      $("gptStatus").textContent = "";
-    } else {
-      $("gptStatus").textContent = j.error ? ("LLMエラー: " + j.error.message) : "";
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}));
+      $("gptStatus").textContent = "LLMエラー: " + (j.error?.message || res.status);
+      return;
     }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let sse = "", pending = "", full = "", first = true;
+    const flush = () => {
+      if (!pending || !ws || ws.readyState !== 1) return;
+      ws.send(JSON.stringify({ type: "say", text: pending, mode: first ? "replace" : "append" }));
+      first = false; pending = "";
+    };
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      sse += dec.decode(value, { stream: true });
+      const lines = sse.split("\n"); sse = lines.pop();
+      for (const ln of lines) {
+        if (!ln.startsWith("data: ") || ln.includes("[DONE]")) continue;
+        try {
+          const c = JSON.parse(ln.slice(6)).choices?.[0]?.delta?.content;
+          if (c) { pending += c; full += c;
+                   if (/[、。!?!?]/.test(c) || pending.length >= 14) flush(); }
+        } catch (_) {}
+      }
+    }
+    flush();
+    if (full) history_.push({ role: "assistant", content: full });
+    $("gptStatus").textContent = "";
   } catch (e) {
     $("gptStatus").textContent = "LLM呼び出し失敗: " + e.message;
   } finally {
