@@ -47,16 +47,16 @@
   </div>
   <div class="panel" style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
     <label style="font-size:.85rem; display:flex; align-items:center; gap:6px;">
-      <input type="checkbox" id="gptMode"> GPT-live モード (裏でGPTが考えてサヨ子が話す)
+      <input type="checkbox" id="gptMode"> 外部LLM応答の注入 (発話確定ごとに gpt-4o-mini の回答をサヨ子の声で読み上げ)
     </label>
-    <input type="password" id="apiKey" placeholder="OpenAI APIキー (未設定なら素のサヨ子)"
+    <input type="password" id="apiKey" placeholder="OpenAI APIキー (未設定なら注入なし)"
            style="flex:1; min-width:220px; font:inherit; font-size:.8rem; padding:6px 10px;
                   border-radius:8px; border:1px solid var(--line); background:#141311; color:var(--ink);">
     <span id="gptStatus" style="font-size:.8rem; color:var(--sub);"></span>
   </div>
   <div class="panel"><div id="chat"></div></div>
-  <div class="note">あなたの字幕はブラウザの音声認識 (Chrome推奨)、サヨ子の字幕はモデルのテキストストリームです。<br>
-  GPT-live モード: あなたの発話が確定するとブラウザから直接 OpenAI に問い合わせ (キーはこのPCから出ません)、回答をサヨ子の声で話します。</div>
+  <div class="note">あなたの字幕はブラウザの音声認識 (Chromium系のみ)、サヨ子の字幕はモデルのテキストストリーム。<br>
+  LLM注入: 発話が確定するとブラウザから直接 OpenAI へ問い合わせ (キーはこのPCから出ません)、回答文をテキストチャンネルへ注入してサヨ子の声で読み上げます。応答待ちの間も相槌などの自由生成は継続します。</div>
 </div>
 
 <script>
@@ -166,7 +166,7 @@ async function askGPT(userUtt) {
   const key = $("apiKey").value.trim();
   if (!$("gptMode").checked || !key || thinking) return;
   thinking = true;
-  $("gptStatus").textContent = "考え中...";
+  $("gptStatus").textContent = "LLM応答待ち...";
   try {
     history_.push({ role: "user", content: userUtt });
     const res = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -191,10 +191,10 @@ async function askGPT(userUtt) {
       ws.send(JSON.stringify({ type: "say", text: ans }));
       $("gptStatus").textContent = "";
     } else {
-      $("gptStatus").textContent = j.error ? ("GPTエラー: " + j.error.message) : "";
+      $("gptStatus").textContent = j.error ? ("LLMエラー: " + j.error.message) : "";
     }
   } catch (e) {
-    $("gptStatus").textContent = "GPT呼び出し失敗: " + e.message;
+    $("gptStatus").textContent = "LLM呼び出し失敗: " + e.message;
   } finally {
     thinking = false;
   }
