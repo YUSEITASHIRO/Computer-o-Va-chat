@@ -106,8 +106,15 @@ def load_models() -> None:
 
     snap = glob.glob(os.path.expanduser(
         "~/.cache/huggingface/hub/models--llm-jp--llm-jp-moshi-v1/snapshots/*/"))[0]
-    model = os.environ.get("MODEL", os.path.expanduser(
-        "~/sayoko-fullduplex/models/ckpt/sayoko-voice-v2/step_390_serve/model.safetensors"))
+    # 既定は最新の v4 (実音声混在学習: SSIM 0.9275、崩れが無い)。
+    # 見つからなければ v2 -> v1 の順にフォールバックする。
+    cands = [os.environ.get("MODEL")] + [os.path.expanduser(p) for p in (
+        "~/sayoko-fullduplex/models/ckpt/sayoko-voice-v4/step_serve/model.safetensors",
+        "~/sayoko-fullduplex/models/ckpt/sayoko-voice-v2/step_390_serve/model.safetensors",
+    )]
+    model = next((c for c in cands if c and os.path.exists(c)), None)
+    if model is None:
+        raise SystemExit("サーブ用モデルが見つかりません (MODEL= で明示指定してください)")
     print(f"[load] model = {model}", flush=True)
     sp = spm_mod.SentencePieceProcessor(model_file=snap + "tokenizer_spm_32k_3.model")
     mimi = loaders.get_mimi(snap + "tokenizer-e351c8d8-checkpoint125.safetensors", device=DEV)

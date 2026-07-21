@@ -17,7 +17,7 @@ echo [3/3] ブラウザを開きます (Chrome 推奨)
 rem OPENAI_KEY を .env から読み、URLフラグメント (#k=) でブラウザにだけ渡す。
 rem フラグメントは HTTP リクエストに含まれないため、キーがサーバへ送られることはない。
 set "KEY="
-for %%F in ("%~dp0.env" "%USERPROFILE%\Desktop\Va-chan\.env") do (
+for %%F in ("%~dp0.env" "%~dp0..\.env" "%USERPROFILE%\Desktop\otamesi\Va-chan\.env" "%USERPROFILE%\Desktop\Va-chan\.env") do (
   if not defined KEY if exist %%F (
     for /f "usebackq tokens=1,* delims==" %%a in (%%F) do (
       if /i "%%a"=="OPENAI_KEY" set "KEY=%%b"
