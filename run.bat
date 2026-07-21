@@ -1,36 +1,80 @@
 @echo off
-chcp 65001 >nul
+setlocal enabledelayedexpansion
 title sayoko-ui-launcher
-echo ============================================
-echo  サヨ子とお話し — 起動中
-echo ============================================
-echo [1/3] g24 でサーバを起動し、ポート転送を張ります...
-start "sayoko-server (閉じると終了)" ssh -L 8998:localhost:8998 g24 "bash ~/sayoko-fullduplex/ui/server/serve_ui.sh"
+rem ---------------------------------------------------------------------------
+rem  NOTE: This launcher is intentionally ASCII-only, CRLF, and calls
+rem  timeout.exe by full path.
+rem   - cmd.exe parses .bat with the system ANSI codepage (CP932 here), so
+rem     UTF-8 Japanese inside a .bat corrupts parsing ("chcp 65001" does not
+rem     help; it only affects console output).
+rem   - LF-only line endings break label/goto handling.
+rem   - "timeout.exe" refuses to run when stdin is redirected, and a bare
+rem     "timeout" can resolve to GNU timeout if Git Bash is on PATH, so we
+rem     sleep with ping instead (full path, no stdin dependency).
+rem ---------------------------------------------------------------------------
+set "PING=%SystemRoot%\System32\ping.exe"
 
-echo [2/3] モデル読込を待っています (60秒ほどかかります)...
-:wait
-timeout /t 5 /nobreak >nul
-powershell -NoProfile -Command "try { $r = Invoke-WebRequest -UseBasicParsing http://localhost:8998/healthz -TimeoutSec 2; if ($r.StatusCode -eq 200) { exit 0 } else { exit 1 } } catch { exit 1 }"
-if errorlevel 1 goto wait
+echo ============================================
+echo   Sayoko voice chat - starting up
+echo ============================================
+echo.
 
-echo [3/3] ブラウザを開きます (Chrome 推奨)
-rem OPENAI_KEY を .env から読み、URLフラグメント (#k=) でブラウザにだけ渡す。
-rem フラグメントは HTTP リクエストに含まれないため、キーがサーバへ送られることはない。
+where ssh >nul 2>&1
+if errorlevel 1 (
+  echo [ERROR] "ssh" not found. Enable the Windows OpenSSH client.
+  goto :failed
+)
+
+rem --- Read OPENAI_KEY from .env -------------------------------------------
+rem The key is handed to the browser through the URL fragment (#k=). Fragments
+rem are never sent in HTTP requests, so the key never reaches the chat server.
 set "KEY="
-for %%F in ("%~dp0.env" "%~dp0..\.env" "%USERPROFILE%\Desktop\otamesi\Va-chan\.env" "%USERPROFILE%\Desktop\Va-chan\.env") do (
-  if not defined KEY if exist %%F (
-    for /f "usebackq tokens=1,* delims==" %%a in (%%F) do (
+for %%F in (
+  "%~dp0.env"
+  "%~dp0..\.env"
+  "%USERPROFILE%\Desktop\otamesi\Va-chan\.env"
+  "%USERPROFILE%\Desktop\Va-chan\.env"
+) do (
+  if not defined KEY if exist "%%~F" (
+    for /f "usebackq tokens=1,* delims==" %%a in ("%%~F") do (
       if /i "%%a"=="OPENAI_KEY" set "KEY=%%b"
       if /i "%%a"=="OPENAI_API_KEY" set "KEY=%%b"
     )
+    if defined KEY echo [info] API key loaded from %%~F
   )
 )
+if not defined KEY echo [info] No OPENAI_KEY in .env - LLM injection disabled.
+
+echo [1/3] Starting server on g24 and forwarding port 8998 ...
+start "sayoko-server (close to quit)" ssh -L 8998:localhost:8998 g24 "bash ~/sayoko-fullduplex/ui/server/serve_ui.sh"
+
+echo [2/3] Waiting for the model to load (60-90 seconds) ...
+set /a TRY=0
+:wait
+"%PING%" -n 6 127.0.0.1 >nul
+powershell -NoProfile -Command "try { $r = Invoke-WebRequest -UseBasicParsing http://localhost:8998/healthz -TimeoutSec 3; exit ($r.StatusCode -ne 200) } catch { exit 1 }"
+if not errorlevel 1 goto :ready
+set /a TRY+=1
+if !TRY! LSS 36 (
+  echo   ... waiting !TRY!/36
+  goto :wait
+)
+echo [ERROR] Server did not come up. Check the "sayoko-server" window.
+goto :failed
+
+:ready
+echo [3/3] Opening the browser (Chrome recommended)
 if defined KEY (
-  start "" "http://localhost:8998/#k=%KEY%"
+  start "" "http://localhost:8998/#k=!KEY!"
 ) else (
-  echo   ※ .env に OPENAI_KEY が見つかりません。GPT-live は画面でキーを入力すると有効になります。
   start "" "http://localhost:8998/"
 )
 echo.
-echo 起動しました。終了するときは "sayoko-server" のウィンドウを閉じてください。
-timeout /t 8 >nul
+echo Ready. Close the browser tab to finish (the server shuts down by itself).
+"%PING%" -n 11 127.0.0.1 >nul
+exit /b 0
+
+:failed
+echo.
+pause
+exit /b 1
