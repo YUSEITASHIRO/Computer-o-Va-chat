@@ -7,9 +7,9 @@ Opus を使わないので実装が単純で、テキストストリームも同
 (将来の GPT-live 型テキスト注入もこのループに足すだけ)。
 
 GPT-live 方式: ブラウザ側が (WebSpeechのユーザー発話 -> OpenAI API) で回答文を作り、
-{"type":"say"} で送ってくる。サーバはそれを rinna SPM トークン化し、テキストチャンネルに
-1トークン/3フレームで強制注入する (PoC 実測の最適ペース: 内容被覆92%・声SSIM 0.923)。
-注入が無い間は素の Moshi として自由生成 (相槌など)。OpenAI キーはサーバに来ない。
+{"type":"say"} で送ってくる。サーバはそれを **学習データと同一構造のフレーム列** に変換して
+(text_schedule.py: 語境界0 + 内容トークン + PAD3、話速 3.9 文字/秒) テキストチャンネルへ
+強制注入する。注入が無い間は素の Moshi として自由生成 (相槌など)。OpenAI キーはサーバに来ない。
 
 プロトコル (ws://<host>/ws):
   クライアント -> サーバ: binary = int16 PCM 1920サンプル (マイク)
@@ -31,10 +31,18 @@ import numpy as np
 import torch
 from aiohttp import WSMsgType, web
 
+from text_schedule import InjectionQueue
+
 FRAME = 1920            # 80ms @ 24kHz
 DEV = "cuda"
 PAD = 3
-INJECT_EVERY = 3        # 1トークン/3フレーム (PoC 実測の最適ペース)
+# 話速 (文字/秒)。学習データ実測 = 実録音 3.92 / 合成対話 4.11。
+# 下げるとゆっくり喋る。text_schedule.build_schedule に渡す。
+CHARS_PER_SEC = float(os.environ.get("CHARS_PER_SEC", "3.9"))
+# 音声 codebook のサンプリング温度。注入中は明瞭度優先で下げる。
+TEMP_AUDIO = float(os.environ.get("TEMP_AUDIO", "0.6"))
+TEMP_AUDIO_FREE = float(os.environ.get("TEMP_AUDIO_FREE", "0.8"))
+TEMP_TEXT = float(os.environ.get("TEMP_TEXT", "0.7"))
 STATIC_DIR = Path(__file__).resolve().parent.parent / "client"
 
 mimi = None
@@ -107,9 +115,13 @@ def load_models() -> None:
     snap = glob.glob(os.path.expanduser(
         "~/.cache/huggingface/hub/models--llm-jp--llm-jp-moshi-v1/snapshots/*/"))[0]
     # 既定は最新の v4 (実音声混在学習: SSIM 0.9275、崩れが無い)。
-    # 見つからなければ v2 -> v1 の順にフォールバックする。
+    # v4 は 2026-07-22 のディスク整理で NFS アーカイブへ退避済み。モデルは起動時に
+    # 一度読むだけなので、ローカルへ戻さず NFS 上のまま参照する (読み込み数分)。
+    ARCHIVE = "/mnt/work-qnap/tashiro_g24_archive_20260722"
     cands = [os.environ.get("MODEL")] + [os.path.expanduser(p) for p in (
+        "~/sayoko-fullduplex/models/ckpt/sayoko-voice-v5/step_serve/model.safetensors",
         "~/sayoko-fullduplex/models/ckpt/sayoko-voice-v4/step_serve/model.safetensors",
+        f"{ARCHIVE}/sayoko-voice-v4/step_serve/model.safetensors",
         "~/sayoko-fullduplex/models/ckpt/sayoko-voice-v2/step_390_serve/model.safetensors",
     )]
     model = next((c for c in cands if c and os.path.exists(c)), None)
@@ -120,8 +132,10 @@ def load_models() -> None:
     mimi = loaders.get_mimi(snap + "tokenizer-e351c8d8-checkpoint125.safetensors", device=DEV)
     mimi.set_num_codebooks(8)
     lm = loaders.get_moshi_lm(model, device=DEV)
-    lm_gen = LMGen(lm, temp=0.8, temp_text=0.7)
+    lm_gen = LMGen(lm, temp=TEMP_AUDIO_FREE, temp_text=TEMP_TEXT)
     forced = ForcedTextLMGen(lm_gen)
+    print(f"[load] chars_per_sec={CHARS_PER_SEC} temp(inject/free)="
+          f"{TEMP_AUDIO}/{TEMP_AUDIO_FREE}", flush=True)
 
     print("[load] warmup...", flush=True)
     z = torch.zeros(1, 1, FRAME, device=DEV)
@@ -145,8 +159,7 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
         return ws
     busy = True
     print("[ws] session start", flush=True)
-    inject_queue: list[int] = []   # LLM 回答の残りトークン
-    inject_tick = 0
+    inject = InjectionQueue(sp, CHARS_PER_SEC)   # 学習と同一構造のフレーム列を供給
     try:
         await ws.send_json({"type": "status", "message": "connected"})
         with torch.no_grad(), mimi.streaming(1), lm_gen.streaming(1):
@@ -158,29 +171,26 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
                         continue
                     if m.get("type") == "say" and m.get("text"):
                         # LLM 回答をテキストチャンネルへ注入する。
-                        # mode=append: ストリーミング注入用 (文の断片が届くたびキュー末尾へ足す)
-                        toks = list(sp.encode(str(m["text"])))
-                        if m.get("mode") == "append" and inject_queue:
-                            inject_queue.extend(toks)
-                        else:
-                            inject_queue = toks
-                            inject_tick = 0
-                        print(f"[inject:{m.get('mode','replace')}] +{len(toks)} tokens: "
-                              f"{str(m['text'])[:40]}", flush=True)
+                        # mode=append: ストリーミング注入用。断片ごとに切らず、
+                        # 未発話分と合わせて再スケジュールする (text_schedule 参照)。
+                        text = str(m["text"])
+                        mode = m.get("mode", "replace")
+                        n = inject.append(text) if (mode == "append" and len(inject)) \
+                            else inject.reset(text)
+                        print(f"[inject:{mode}] {n} frames "
+                              f"({n / 12.5:.1f}s): {text[:40]}", flush=True)
                     continue
                 if msg.type != WSMsgType.BINARY:
                     continue
                 pcm = np.frombuffer(msg.data, dtype=np.int16).astype(np.float32) / 32768.0
                 if len(pcm) != FRAME:
                     continue
-                # 注入中: INJECT_EVERY フレームに1トークン、間は PAD を強制。
+                # 注入中はスケジュール済みフレーム (0=語境界 / 3=PAD / 内容) をそのまま強制。
                 # 空になったら強制を解除して自由生成に戻す。
-                if inject_queue:
-                    forced.next_forced_text = (
-                        inject_queue.pop(0) if inject_tick % INJECT_EVERY == 0 else PAD)
-                    inject_tick += 1
-                else:
-                    forced.next_forced_text = None
+                nxt = inject.pop()
+                forced.next_forced_text = nxt
+                # 注入中は音声温度を下げて明瞭度を優先する
+                lm_gen.temp = TEMP_AUDIO if nxt is not None else TEMP_AUDIO_FREE
                 x = torch.from_numpy(pcm)[None, None].to(DEV)
                 out = forced.step(mimi.encode(x))
                 if out is None:          # 起動直後の delay 埋め区間
